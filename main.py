@@ -1,9 +1,10 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 from pymongo import MongoClient
 from PIL import Image
 from datetime import datetime
+from typing import List
 import os
 import io
 
@@ -21,7 +22,7 @@ app.add_middleware(
 )
 
 # -----------------------------
-# Load trained YOLO model once
+# Load YOLO Model Once
 # -----------------------------
 model = YOLO("best.pt")
 
@@ -38,6 +39,11 @@ db = client["smart_dog"]
 collection = db["detections"]
 
 # -----------------------------
+# WebSocket Clients Storage
+# -----------------------------
+connected_clients: List[WebSocket] = []
+
+# -----------------------------
 # Home Route
 # -----------------------------
 @app.get("/")
@@ -45,17 +51,28 @@ def home():
     return {"message": "Smart Dog Collar AI Running"}
 
 # -----------------------------
+# WebSocket Endpoint
+# -----------------------------
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    connected_clients.append(websocket)
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except:
+        connected_clients.remove(websocket)
+
+# -----------------------------
 # ESP32 Upload + AI Detection
 # -----------------------------
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
-
     try:
-        # Read image directly from memory (no local saving)
         contents = await file.read()
         image = Image.open(io.BytesIO(contents))
 
-        # Run YOLO inference
         results = model(image)
 
         detected_classes = []
@@ -80,7 +97,7 @@ async def upload_image(file: UploadFile = File(...)):
         else:
             status = "No Bowl Detected"
 
-        # Store latest result in MongoDB
+        # Data to store
         data = {
             "_id": "latest",
             "status": status,
@@ -88,11 +105,20 @@ async def upload_image(file: UploadFile = File(...)):
             "timestamp": datetime.utcnow()
         }
 
+        # Save in MongoDB
         collection.update_one(
             {"_id": "latest"},
             {"$set": data},
             upsert=True
         )
+
+        # Push to WebSocket clients (REAL-TIME)
+        for client in connected_clients:
+            await client.send_json({
+                "status": status,
+                "confidence": highest_confidence,
+                "timestamp": str(datetime.utcnow())
+            })
 
         return {
             "detected_classes": detected_classes,
@@ -104,11 +130,10 @@ async def upload_image(file: UploadFile = File(...)):
         return {"error": str(e)}
 
 # -----------------------------
-# Get Latest Status (Flutter App)
+# Get Latest Status (Flutter Fallback)
 # -----------------------------
 @app.get("/status")
 async def get_status():
-
     latest = collection.find_one({"_id": "latest"})
 
     if not latest:
