@@ -1,46 +1,121 @@
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
-import shutil
+from pymongo import MongoClient
+from PIL import Image
+from datetime import datetime
 import os
+import io
 
 app = FastAPI()
 
-# Load trained model once
+# -----------------------------
+# CORS (For Flutter / ESP32)
+# -----------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------------
+# Load trained YOLO model once
+# -----------------------------
 model = YOLO("best.pt")
 
-UPLOAD_FOLDER = "received"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# -----------------------------
+# MongoDB Connection
+# -----------------------------
+MONGO_URL = os.getenv("MONGO_URL")
 
+if not MONGO_URL:
+    raise Exception("MONGO_URL not set in environment variables")
 
+client = MongoClient(MONGO_URL)
+db = client["smart_dog"]
+collection = db["detections"]
+
+# -----------------------------
+# Home Route
+# -----------------------------
 @app.get("/")
 def home():
     return {"message": "Smart Dog Collar AI Running"}
 
-
+# -----------------------------
+# ESP32 Upload + AI Detection
+# -----------------------------
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
 
-    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    try:
+        # Read image directly from memory (no local saving)
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents))
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        # Run YOLO inference
+        results = model(image)
 
-    # Run YOLO inference
-    results = model(file_path)
+        detected_classes = []
+        highest_confidence = 0.0
 
-    detected_class = None
+        for r in results:
+            for box in r.boxes:
+                class_id = int(box.cls[0])
+                confidence = float(box.conf[0])
+                class_name = model.names[class_id]
 
-    for r in results:
-        for box in r.boxes:
-            class_id = int(box.cls[0])
-            class_name = model.names[class_id]
-            detected_class = class_name
+                detected_classes.append(class_name)
 
-    if detected_class == "empty_bowl":
-        status = "Dog Finished Eating"
-    elif detected_class == "food_bowl":
-        status = "Food Still In Bowl"
-    else:
-        status = "No Bowl Detected"
+                if confidence > highest_confidence:
+                    highest_confidence = confidence
 
-    return {"detected": detected_class, "status": status}
+        # Decide eating status
+        if "empty_bowl" in detected_classes:
+            status = "Dog Finished Eating"
+        elif "food_bowl" in detected_classes:
+            status = "Food Still In Bowl"
+        else:
+            status = "No Bowl Detected"
+
+        # Store latest result in MongoDB
+        data = {
+            "_id": "latest",
+            "status": status,
+            "confidence": highest_confidence,
+            "timestamp": datetime.utcnow()
+        }
+
+        collection.update_one(
+            {"_id": "latest"},
+            {"$set": data},
+            upsert=True
+        )
+
+        return {
+            "detected_classes": detected_classes,
+            "status": status,
+            "confidence": highest_confidence
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+# -----------------------------
+# Get Latest Status (Flutter App)
+# -----------------------------
+@app.get("/status")
+async def get_status():
+
+    latest = collection.find_one({"_id": "latest"})
+
+    if not latest:
+        return {"status": "No Data Yet"}
+
+    return {
+        "status": latest["status"],
+        "confidence": latest["confidence"],
+        "timestamp": latest["timestamp"]
+    }
