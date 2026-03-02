@@ -5,6 +5,7 @@ from pymongo import MongoClient
 from PIL import Image
 from datetime import datetime
 from typing import List
+from pydantic import BaseModel
 import os
 import io
 
@@ -37,6 +38,9 @@ if not MONGO_URL:
 client = MongoClient(MONGO_URL)
 db = client["smart_dog"]
 collection = db["detections"]
+
+# ✅ NEW SENSOR COLLECTION
+sensor_collection = db["sensor_data"]
 
 # -----------------------------
 # WebSocket Clients Storage
@@ -97,7 +101,6 @@ async def upload_image(file: UploadFile = File(...)):
         else:
             status = "No Bowl Detected"
 
-        # Data to store
         data = {
             "_id": "latest",
             "status": status,
@@ -105,14 +108,12 @@ async def upload_image(file: UploadFile = File(...)):
             "timestamp": datetime.utcnow()
         }
 
-        # Save in MongoDB
         collection.update_one(
             {"_id": "latest"},
             {"$set": data},
             upsert=True
         )
 
-        # Push to WebSocket clients (REAL-TIME)
         for client in connected_clients:
             await client.send_json({
                 "status": status,
@@ -130,7 +131,7 @@ async def upload_image(file: UploadFile = File(...)):
         return {"error": str(e)}
 
 # -----------------------------
-# Get Latest Status (Flutter Fallback)
+# Get Latest AI Status
 # -----------------------------
 @app.get("/status")
 async def get_status():
@@ -143,4 +144,76 @@ async def get_status():
         "status": latest["status"],
         "confidence": latest["confidence"],
         "timestamp": latest["timestamp"]
+    }
+
+# =====================================================
+# =============== SENSOR SECTION START ================
+# =====================================================
+
+# -----------------------------
+# Sensor Data Models
+# -----------------------------
+class MotionData(BaseModel):
+    accel_x: float
+    accel_y: float
+    accel_z: float
+    movement_detected: bool
+
+class SensorPayload(BaseModel):
+    device_id: str
+    temperature_c: float
+    motion: MotionData
+    timestamp: datetime
+
+# -----------------------------
+# ESP32 Sensor Update Endpoint
+# -----------------------------
+@app.post("/sensor/update")
+async def update_sensor(payload: SensorPayload):
+
+    if payload.motion.movement_detected:
+        activity = "ACTIVE"
+    else:
+        activity = "INACTIVE"
+
+    temp_alert = None
+    if payload.temperature_c > 39:
+        temp_alert = "High Temperature"
+    elif payload.temperature_c < 35:
+        temp_alert = "Low Temperature"
+
+    data = {
+        "_id": payload.device_id,
+        "temperature_c": payload.temperature_c,
+        "movement_detected": payload.motion.movement_detected,
+        "activity": activity,
+        "temp_alert": temp_alert,
+        "timestamp": datetime.utcnow()
+    }
+
+    sensor_collection.update_one(
+        {"_id": payload.device_id},
+        {"$set": data},
+        upsert=True
+    )
+
+    return {"message": "Sensor data updated successfully"}
+
+# -----------------------------
+# Get Latest Sensor Status
+# -----------------------------
+@app.get("/sensor/status/{device_id}")
+async def get_sensor_status(device_id: str):
+
+    data = sensor_collection.find_one({"_id": device_id})
+
+    if not data:
+        return {"error": "No sensor data yet"}
+
+    return {
+        "temperature_c": data["temperature_c"],
+        "movement_detected": data["movement_detected"],
+        "activity": data["activity"],
+        "temp_alert": data["temp_alert"],
+        "timestamp": data["timestamp"]
     }
