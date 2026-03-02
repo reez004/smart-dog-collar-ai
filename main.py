@@ -38,8 +38,6 @@ if not MONGO_URL:
 client = MongoClient(MONGO_URL)
 db = client["smart_dog"]
 collection = db["detections"]
-
-# ✅ NEW SENSOR COLLECTION
 sensor_collection = db["sensor_data"]
 
 # -----------------------------
@@ -69,7 +67,7 @@ async def websocket_endpoint(websocket: WebSocket):
         connected_clients.remove(websocket)
 
 # -----------------------------
-# ESP32 Upload + AI Detection
+# ESP32-CAM Upload + AI Detection
 # -----------------------------
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
@@ -93,7 +91,7 @@ async def upload_image(file: UploadFile = File(...)):
                 if confidence > highest_confidence:
                     highest_confidence = confidence
 
-        # Decide eating status
+        # Eating status logic
         if "empty_bowl" in detected_classes:
             status = "Dog Finished Eating"
         elif "food_bowl" in detected_classes:
@@ -114,8 +112,9 @@ async def upload_image(file: UploadFile = File(...)):
             upsert=True
         )
 
-        for client in connected_clients:
-            await client.send_json({
+        # Push to WebSocket clients
+        for client_ws in connected_clients:
+            await client_ws.send_json({
                 "status": status,
                 "confidence": highest_confidence,
                 "timestamp": str(datetime.utcnow())
@@ -147,22 +146,16 @@ async def get_status():
     }
 
 # =====================================================
-# =============== SENSOR SECTION START ================
+# =============== SENSOR SECTION ======================
 # =====================================================
 
 # -----------------------------
-# Sensor Data Models
+# Sensor Data Model (NEW)
 # -----------------------------
-class MotionData(BaseModel):
-    accel_x: float
-    accel_y: float
-    accel_z: float
-    movement_detected: bool
-
 class SensorPayload(BaseModel):
     device_id: str
     temperature_c: float
-    motion: MotionData
+    activity: str   # RESTING / WALKING / RUNNING / SLEEPING
     timestamp: datetime
 
 # -----------------------------
@@ -171,11 +164,7 @@ class SensorPayload(BaseModel):
 @app.post("/sensor/update")
 async def update_sensor(payload: SensorPayload):
 
-    if payload.motion.movement_detected:
-        activity = "ACTIVE"
-    else:
-        activity = "INACTIVE"
-
+    # Temperature Alert Logic
     temp_alert = None
     if payload.temperature_c > 39:
         temp_alert = "High Temperature"
@@ -185,8 +174,7 @@ async def update_sensor(payload: SensorPayload):
     data = {
         "_id": payload.device_id,
         "temperature_c": payload.temperature_c,
-        "movement_detected": payload.motion.movement_detected,
-        "activity": activity,
+        "activity": payload.activity,
         "temp_alert": temp_alert,
         "timestamp": datetime.utcnow()
     }
@@ -212,7 +200,6 @@ async def get_sensor_status(device_id: str):
 
     return {
         "temperature_c": data["temperature_c"],
-        "movement_detected": data["movement_detected"],
         "activity": data["activity"],
         "temp_alert": data["temp_alert"],
         "timestamp": data["timestamp"]
